@@ -1,0 +1,100 @@
+# Questions
+
+Answer each question below. Replace the blank lines with your response.
+
+## Part 1: Database Optimization
+
+**1. In general, writes such as changing grades should only occur on the smaller normalized tables. Explain why. Since SQLite does not support materialized views, we write to both the normalized and denormalized tables instead. What problem(s) could this introduce?**
+
+Writes should target normalized tables because they are the single source of truth — each fact is stored in exactly one place, so updates are atomic and consistent. Denormalized tables duplicate data across multiple rows (e.g. an instructor name appears in every student's row), so updating the normalized table alone keeps writes simple and avoids update anomalies. Since SQLite lacks materialized views, we must manually write to both the normalized and denormalized tables. This dual-write approach can introduce consistency problems: if the application crashes between writing to the normalized table and the denormalized table, the two will be out of sync. It also increases code complexity since every write path must remember to update both locations, and bugs in one update path can silently introduce stale data that is difficult to detect.
+
+**2. For each denormalized table you created, explain why you chose that specific set of columns. Why not include additional columns that might be useful later?**
+
+Each denormalized table contains exactly the columns its view needs and nothing more:
+- `student_courses`: login_uid (filter key), course_id, course_code, course_title, instructor — the student dashboard shows only these fields.
+- `professor_courses`: professor_uid (filter key), course_id, course_code, course_title, instructor — same shape as the student dashboard but filtered by professor.
+- `course_content`: course_id (filter key), week_id, week_title, week_sort, entry_id, entry_title, entry_type, entry_url, entry_sort — everything needed to render the module list.
+- `course_students`: course_id (filter key), uid, name — the roster only shows student name and UID.
+- `student_grades`: login_uid + course_id (composite filter), grade_id, assignment_id, assignment_name, score, sort_order — the grades view needs these to display and allow editing.
+
+Including additional "just in case" columns would waste storage (duplicated across every row), slow down reads by increasing row size (more data to scan/transfer from disk), and create more places where update anomalies could occur. If a new view needs different data, it's better to create a separate denormalized table for that view.
+
+**3. Why not skip denormalization and just add indexes to the normalized tables?**
+
+Indexes speed up row lookup but do not eliminate the cost of JOINs. With normalized tables, even if each table has an index, the database must still: (1) look up rows in the first table, (2) for each matching row, look up the corresponding row in the joined table via its index, and (3) combine the results. This produces random I/O across multiple tables and grows more expensive as tables scale. Denormalized tables pre-compute the join so the query reads from a single contiguous table with one index lookup — no join processing, no cross-table I/O, and predictable performance regardless of how many normalized tables would have been involved.
+
+**4. Which users should be able to read which data? Which users should be able to write which data? For each API endpoint, describe who should have access and what kind of access they should have.**
+
+- `GET /api/students/:uid/courses` — Only the student identified by :uid should be able to read their own enrolled courses. No write access.
+- `GET /api/professors/:uid/courses` — Only the professor identified by :uid should be able to read their own taught courses. No write access.
+- `GET /api/courses/:courseId/content` — Any authenticated user enrolled in or teaching the course should be able to read the content. No write access through this endpoint.
+- `GET /api/courses/:courseId/students` — Only the professor teaching the course should be able to read the roster. Students should not see other students' UIDs.
+- `GET /api/students/:uid/courses/:courseId/grades` — Only the student identified by :uid should be able to read their own grades. Professors teaching the course should also be able to read any student's grades.
+- `POST /api/grades` — Only a professor teaching the relevant course should be able to write/update grades. Students should have no write access to grades.
+
+
+
+## Part 2: Security
+
+For each vulnerability, describe in your own words: (1) what the security hole is and what it allows an attacker to do, and (2) how you fixed it and why your fix works.
+
+**HTTPS:**
+
+The server ran over plain HTTP, meaning all traffic between the browser and server (including passwords and session data) was sent in cleartext. An attacker on the same network could intercept and read everything using a packet sniffer. I fixed this by using `https.createServer()` with a locally-trusted TLS certificate generated by mkcert. Now all communication is encrypted, so eavesdroppers cannot read the data in transit.
+
+**SQL Injection:**
+
+The login query used string interpolation (`WHERE uid = '${uid}'`) to embed user input directly into SQL. An attacker could enter a crafted UID like `' OR '1'='1` to bypass authentication and log in as any user, or use UNION-based injection to extract data from other tables. I fixed this by switching to parameterized queries (`WHERE uid = ?`) which pass user input as bound parameters — the database treats them as data, never as SQL syntax.
+
+**Command Injection:**
+
+The search endpoint passed user input directly into a shell command via `execSync(\`grep -rl "${query}" public/\`)`. An attacker could inject shell metacharacters like `"; rm -rf / ; echo "` to execute arbitrary commands on the server. I fixed this by replacing `execSync` with `execFileSync('grep', ['-rl', query, 'public/'])`, which invokes the command directly without a shell. Each array element is passed as a literal argument, so shell metacharacters have no special meaning.
+
+**Cross-Site Scripting (XSS):**
+
+Server-supplied data (course codes, instructor names, assignment names, entry titles) was inserted directly into the page via `innerHTML` without escaping. An attacker who could control this data (e.g., a malicious course title containing `<script>...</script>`) could execute arbitrary JavaScript in other users' browsers to steal sessions or modify page content. I fixed this in two layers: (1) all server data is passed through an `escapeHtml()` function that replaces `<`, `>`, `"`, `'`, and `&` with HTML entities before insertion, and (2) a Content-Security-Policy header (`script-src 'self'`) blocks execution of any inline scripts even if escaping is somehow bypassed.
+
+**Broken Authentication:**
+
+The original system had no server-side session management — the server didn't know who was making requests. Passwords were stored in plaintext (readable if the database was compromised) and the password field used `type="text"` (visible to shoulder surfers). The login endpoint also returned user info even when the password was wrong. I fixed this by: (1) hashing passwords with scrypt + random salt before storing them, (2) changing the input to `type="password"`, (3) implementing JWT-based authentication where login issues signed access and refresh tokens stored in HttpOnly/Secure/SameSite=Strict cookies, and (4) adding middleware that verifies the JWT on every protected request. The JWT secret and token expiration times are configured via `.env`.
+
+**Broken Access Control:**
+
+API endpoints did not verify who was making the request. Any user could access another user's courses or grades by changing the UID in the URL, and any user could call `POST /api/grades` to modify grades. I fixed this by adding the `authenticate` middleware to all protected routes and checking the JWT's claims against the requested resource: students can only access their own data, professors can only access courses they teach, and only professors can modify grades. Requests that fail these checks receive a 403 Forbidden response.
+
+**Cross-Site Request Forgery (CSRF):**
+
+The application had `Access-Control-Allow-Origin: *` which allowed any website to make credentialed requests to the API. A malicious site in another tab could submit a grade change on behalf of a logged-in professor. I fixed this with three layers: (1) CORS headers only set for the application's own origin (`https://localhost:3000`), (2) state-changing requests (POST/PUT/DELETE) validate the Origin header and reject requests from foreign origins, and (3) JWT cookies use `SameSite: Strict` which prevents the browser from sending them on cross-site requests entirely.
+
+**Dependency Vulnerabilities:**
+
+`npm audit` reported a high-severity vulnerability in `jsonwebtoken@8.5.1` — it allowed signature validation bypass and key confusion attacks that could let an attacker forge tokens. I ran `npm audit fix --force` to upgrade to `jsonwebtoken@9.0.3` which fixes these issues. I also specify `{ algorithms: ['HS256'] }` in `jwt.verify()` to prevent algorithm confusion attacks.
+
+
+
+
+
+## Part 3: React
+
+**5. Where does the expanded/collapsed state for each module live in your component hierarchy? Why did you put it there?**
+
+The collapsed state lives as a `useState` hook inside the `Module` component. Each `Module` independently tracks whether it is expanded or collapsed. I put it there because the state is purely local to each module section — no other component (not the parent `CourseContent`, not sibling `Module`s, not `Entry` components) needs to know whether a particular module is collapsed. Lifting it higher would force the parent to manage an array of booleans and pass them down, adding complexity with no benefit. Keeping it in `Module` follows the React principle of placing state as close as possible to where it's used.
+
+**6. What did React make easier compared to the vanilla JavaScript implementation? What did it make harder?**
+
+React made the interactive module toggle much cleaner. In vanilla JS, toggling required manually finding the sibling DOM element and adding/removing CSS classes imperatively. In React, `collapsed` is just a boolean in state, and the className is computed declaratively from it — the UI always reflects the current state without manual DOM queries. React also handles XSS escaping automatically for text content in JSX, so I didn't need to call `escapeHtml()` on titles and entry names within the React components. On the other hand, React made the SVG icons slightly more awkward — since they're raw HTML strings, I had to use `dangerouslySetInnerHTML` to render them, which feels clunky compared to just dropping them into an innerHTML template literal. The build step (esbuild) also adds a layer of tooling that didn't exist with plain JS files. And integrating React into an otherwise vanilla JS app required a bridging pattern (`window.renderCourseContent`) that wouldn't be needed in a fully React-based application.
+
+
+
+## Part 4: Responsive Design
+
+**7. For each media query breakpoint, explain why you chose that specific cutoff value and what layout or usability problem it solves. Describe the changes you made at each breakpoint in terms of the user experience (e.g. "the sidebar collapses into a hamburger menu because there isn't enough horizontal space to show it alongside the content"), not just the CSS properties you changed.**
+
+**Tablet breakpoint — `@media (max-width: 768px)`:** This matches the iPad's 768px CSS viewport width in portrait. At this width, the 240px sidebar plus the main content area would leave too little horizontal space for readable module content. The sidebar shrinks to 180px, padding throughout is reduced, and the course grid switches to smaller minimum card widths (200px instead of 260px) so two cards still fit side-by-side. Grade table cells get tighter padding to avoid horizontal overflow. The student navigator buttons shrink slightly. The overall effect is that all views remain fully usable at tablet width without horizontal scrolling or clipped content.
+
+**Phone breakpoint — `@media (max-width: 480px)`:** This covers the Google Pixel 10's ~412px CSS viewport and similar phone-sized screens. At this width, the sidebar can no longer sit beside the content, so the course layout switches from a horizontal flex row to a vertical column — the sidebar moves to the top with its module list displayed as a horizontal scrollable strip (similar to tabs), because a 240px vertical sidebar would consume over half the screen width. The dashboard course grid becomes a single column so cards are full-width and easy to tap. The topbar hides the user greeting text (keeping only the logout button) to avoid text overflow. The professor's student navigator wraps its buttons onto a second line, and the Save button goes full-width for easier tapping. Typography scales down proportionally so content doesn't overflow.
+
+**8. If you used AI for this part, what did you prompt it with, and what did you have to fix or adjust by hand?**
+
+I used Cascade (AI) to help implement the responsive design. I provided it with the project's CSS files and the Part 4 requirements from the README (target devices, relative units, two breakpoints, image scaling). It generated the media queries and `clamp()`/`min()` conversions. I verified the results in Chrome DevTools using the iPad profile and a custom Google Pixel 10 profile (412×923, DPR 2.625). The main thing I learned is that `clamp()` is very effective for fluid typography and spacing — it eliminates the need for many separate media query overrides by smoothly interpolating between a minimum and maximum value based on viewport width.
+
